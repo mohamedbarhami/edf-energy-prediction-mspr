@@ -1,639 +1,657 @@
-# EDF Energy Prediction
+# EDF Energy Prediction — MSPR TPRE932 / TPRE942
 
-**Version 1.0.0**
+Plateforme de **data engineering**, **machine learning** et **monitoring** pour la prédiction de la consommation électrique nationale à partir des données **RTE éCO2mix**.
 
-Plateforme de **data engineering** et **machine learning** pour les données **RTE éco2mix** (consommation, mix énergétique, échanges, CO₂). Elle implémente une architecture médaillon **Bronze → Silver → Gold → Modeling**, orchestrée par **Apache Airflow** et exécutable en local via **Docker Compose** et le **Makefile**.
+Ce projet a été réalisé dans le cadre de la MSPR 2025–2026 pour la certification **Chef de Projet Expert en Intelligence Artificielle — RNCP36582 Niveau 7**.
 
-| Domaine | Description |
-|---------|-------------|
-| Ingestion | Fichiers XLS batch et flux Kafka (delta quotidien) |
-| Stockage | MinIO (lac de données) + PostgreSQL (entrepôt & audit) |
-| Traitement | Apache Spark 3.5 (ETL et entraînement ML) |
-| Livrables | Rapports PNG, modèles ML, métriques et dashboards Grafana |
-
-> **Périmètre actuel :** environnement local Docker Compose (développement, recette, démonstration). La logique métier est portable vers un déploiement cloud (Kubernetes, MWAA, EMR, etc.) ; l'infrastructure cible reste à adapter.
+L’objectif n’est pas seulement de construire un modèle de prédiction, mais de préparer une solution IA **déployable, maintenable, supervisable et exploitable** dans un environnement technique complet.
 
 ---
 
-## Sommaire
+## 1. Objectifs du projet
 
-1. [Architecture](#architecture)
-2. [Démarrage rapide](#démarrage-rapide)
-3. [Chaîne de traitement](#chaîne-de-traitement)
-4. [Modes d'exécution](#modes-dexécution)
-5. [Orchestration Airflow](#orchestration-airflow)
-6. [Rapports et modèles ML](#rapports-et-modèles-ml)
-7. [Qualité et observabilité](#qualité-et-observabilité)
-8. [Configuration](#configuration)
-9. [Interfaces](#interfaces)
-10. [Schéma PostgreSQL](#schéma-postgresql)
-11. [Tests](#tests)
-12. [Structure du projet](#structure-du-projet)
-13. [Runbook opérationnel](#runbook-opérationnel)
+Le projet **EDF Energy Prediction** vise à mettre en place une chaîne complète permettant de :
+
+* ingérer les données RTE éCO2mix ;
+* organiser les données selon une architecture **Bronze → Silver → Gold** ;
+* nettoyer, contrôler et enrichir les données ;
+* entraîner plusieurs modèles de machine learning ;
+* comparer les performances des modèles ;
+* sélectionner le meilleur modèle ;
+* stocker les métriques et les artefacts ML ;
+* générer des rapports EDA et ML ;
+* superviser les résultats avec Grafana ;
+* préparer la maintenabilité, le monitoring, le rollback et le déploiement de la solution IA.
 
 ---
 
-## Architecture
+## 2. Contexte métier
 
-```
-                  ┌─────────────────────────────────────────────────┐
-                  │             XLS RTE éco2mix (TSV)               │
-                  └─────────────────┬───────────────────────────────┘
-                                    │
-            ┌───────────────────────┴───────────────────────┐
-            │                                               │
-            ▼  (streaming Kafka)              ▼  (batch Spark)
-  ┌──────────────────────┐                ┌──────────────────────┐
-  │  rte_producer        │                │  xls_to_bronze       │
-  │  → topics Kafka      │                │                      │
-  └──────────┬───────────┘                └──────────┬───────────┘
-             │         rte_pipeline.parsing        │
-             └────────────────────┬────────────────┘
-                                  ▼
-                        ┌────────────────────┐
-                        │  MinIO — BRONZE    │  s3a://edf-bronze/rte/
-                        └─────────┬──────────┘
-                                  │  bronze_to_silver
-                                  ▼
-                        ┌────────────────────┐         PostgreSQL
-                        │  MinIO — SILVER    │ ──────► dw.fact_consumption_silver
-                        └─────────┬──────────┘
-                                  │  silver_to_gold
-                                  ▼
-                        ┌────────────────────┐         PostgreSQL
-                        │  MinIO — GOLD      │ ──────► dw.agg_daily / agg_monthly
-                        └─────────┬──────────┘
-                                  │  gold_to_model
-                                  ▼
-                        ┌────────────────────┐
-                        │  MODELING (ML)     │ ──────► s3a://models/rte/best/
-                        └────────────────────┘         etl.model_metrics
+La consommation électrique nationale varie selon plusieurs facteurs : saison, heure, jour de la semaine, usages, historique de consommation et prévisions disponibles.
+
+Dans un contexte énergétique, la capacité à anticiper la consommation permet de mieux suivre l’équilibre entre production et demande. La prédiction de consommation est donc un cas d’usage pertinent pour une solution d’intelligence artificielle appliquée au secteur de l’énergie.
+
+Le projet utilise les données **RTE éCO2mix**, qui fournissent des informations sur la consommation électrique, les prévisions J-1, le mix énergétique et certains indicateurs liés au système électrique français.
+
+---
+
+## 3. Architecture générale
+
+La solution repose sur une architecture de type **Data Lake + MLOps simplifié**.
+
+```text
+RTE éCO2mix
+    ↓
+Bronze
+    ↓
+Silver
+    ↓
+Gold
+    ↓
+Machine Learning
+    ↓
+PostgreSQL / MinIO
+    ↓
+Grafana / Rapports EDA-ML
 ```
 
-**Parsing partagé :** `rte_pipeline/parsing/xls.py` — unique pour Spark, Kafka et Airflow.
+### Rôle des principales couches
 
-**Bronze :** source de vérité **MinIO** (`edf-bronze`, Parquet). PostgreSQL démarre à **Silver**.
-
-### Buckets MinIO
-
-| Bucket | Contenu |
-|--------|---------|
-| `edf-bronze` | Données brutes Parquet (`rte/raw/`, `rte/tempo/`, streaming) |
-| `edf-silver` | Couche nettoyée et enrichie |
-| `edf-gold` | Agrégats analytiques |
-| `models` | Artefacts Spark ML (`rte/`, `rte/best/`) |
-| `rapport-eda` | Graphiques du rapport professionnel (`report/*.png` — préfixe `REPORT_EDA_S3_PREFIX`) |
-
-### Stack technique
-
-| Composant | Rôle | Port (hôte) |
-|-----------|------|-------------|
-| Apache Kafka | Bus de messagerie (ingestion streaming) | 29092 |
-| Apache Spark | ETL et entraînement ML | 7077 / UI 8082 |
-| Apache Airflow | Orchestration, retries, audit | 8081 |
-| MinIO | Object storage S3-compatible | 9000 / Console 9001 |
-| PostgreSQL 16 | Entrepôt DW + audit ETL/ML | 5432 |
-| Prometheus | Métriques infrastructure | 9090 |
-| Grafana | Dashboards ETL, qualité, ML | 3001 |
-| Kafka UI | Inspection topics / messages | 8085 |
+| Couche     | Rôle                                     | Objectif                                          |
+| ---------- | ---------------------------------------- | ------------------------------------------------- |
+| Bronze     | Conservation des données brutes          | Garder une trace fidèle de la source              |
+| Silver     | Nettoyage, harmonisation, enrichissement | Produire des données fiables                      |
+| Gold       | Agrégations analytiques                  | Préparer les données pour reporting et ML         |
+| Modeling   | Entraînement et comparaison des modèles  | Sélectionner le meilleur modèle                   |
+| Reporting  | Génération des visuels EDA / ML          | Vérifier les résultats et produire des preuves    |
+| Monitoring | Suivi avec Grafana                       | Superviser la qualité, les métriques et le modèle |
 
 ---
 
-## Démarrage rapide
+## 4. Stack technique
 
-### Prérequis
+| Composant      | Rôle dans le projet                          | Port local  |
+| -------------- | -------------------------------------------- | ----------- |
+| Docker Compose | Conteneurisation de la plateforme            | —           |
+| Apache Airflow | Orchestration des pipelines                  | 8081        |
+| Apache Spark   | Traitements distribués et ML                 | 7077 / 8082 |
+| MinIO          | Stockage objet compatible S3                 | 9000 / 9001 |
+| PostgreSQL     | Stockage des métriques et tables analytiques | 5432        |
+| Grafana        | Dashboards de monitoring                     | 3001        |
+| Prometheus     | Collecte de métriques techniques             | 9090        |
+| Kafka          | Préparation à l’ingestion événementielle     | 29092       |
+| Kafka UI       | Interface de suivi Kafka                     | 8085        |
 
-| Élément | Détail |
-|---------|--------|
-| Docker Desktop | 8 Go RAM recommandés |
-| Données source | Fichiers `eCO2mix_RTE_*.xls` dans `./data/raw/` |
-| Configuration | Fichier `.env` optionnel à la racine (voir [Configuration](#configuration)) |
+---
 
-### Installation
+## 5. Pipeline principal
+
+Le pipeline principal est orchestré par Airflow via le DAG :
+
+```text
+edf_pipeline_complet
+```
+
+Il suit la logique suivante :
+
+```text
+start
+  ↓
+prerequisites
+  ↓
+bronze
+  ↓
+silver
+  ↓
+gold
+  ↓
+quality
+  ↓
+ml
+  ↓
+reporting
+  ↓
+finalize_pipeline_run
+  ↓
+end
+```
+
+### Description des étapes
+
+| Étape                 | Description                                               |
+| --------------------- | --------------------------------------------------------- |
+| prerequisites         | Vérifie les sources et initialise les éléments techniques |
+| bronze                | Charge les données brutes RTE                             |
+| silver                | Nettoie et harmonise les données                          |
+| gold                  | Produit les agrégats utiles                               |
+| quality               | Exécute les contrôles qualité                             |
+| ml                    | Entraîne et compare les modèles                           |
+| reporting             | Génère les rapports EDA et ML                             |
+| finalize_pipeline_run | Finalise le run et trace son statut                       |
+
+La partie ML contient une logique conditionnelle :
+
+* `run_gold_to_model` : lance l’entraînement ML si les données sont prêtes ;
+* `skip_ml_training` : ignore l’entraînement si les conditions ne sont pas réunies ;
+* `generate_eda_ml_report` : génère les visuels ML si les artefacts sont disponibles ;
+* `mark_eda_ml_pending` : marque le reporting ML comme en attente si nécessaire.
+
+---
+
+## 6. Modèles de machine learning
+
+Le problème traité est un problème de **régression supervisée**.
+
+La variable cible est :
+
+```text
+consumption_mw
+```
+
+Elle représente la consommation électrique à prédire, exprimée en MW.
+
+### Modèles comparés
+
+Quatre modèles ont été testés :
+
+| Modèle            | Rôle                                            |
+| ----------------- | ----------------------------------------------- |
+| Linear Regression | Modèle de référence simple                      |
+| Decision Tree     | Modèle interprétable à base de règles           |
+| Random Forest     | Modèle robuste basé sur plusieurs arbres        |
+| Gradient Boosting | Modèle ensembliste performant mais plus coûteux |
+
+---
+
+## 7. Prévention de la fuite de données
+
+Une correction importante a été réalisée afin d’éviter un risque de **fuite de données** dans la partie machine learning.
+
+Certaines variables descriptives du mix énergétique peuvent être utiles pour l’analyse et les dashboards, mais elles ne doivent pas être utilisées comme variables d’entrée du modèle si elles représentent des informations connues uniquement au moment cible.
+
+### Variables conservées pour l’analyse descriptive
+
+Les variables liées au mix énergétique sont conservées dans les couches Silver / Gold et dans Grafana :
+
+* nucléaire ;
+* hydraulique ;
+* éolien ;
+* solaire ;
+* gaz ;
+* charbon ;
+* bioénergie ;
+* taux de CO₂ ;
+* parts du mix énergétique.
+
+Elles servent à l’analyse métier et au monitoring.
+
+### Variables utilisées pour le modèle final
+
+Le modèle final utilise uniquement des variables disponibles avant la prédiction :
+
+* variables temporelles ;
+* encodage cyclique de l’heure ;
+* indicateurs calendrier ;
+* historiques de consommation ;
+* moyennes glissantes ;
+* prévision RTE J-1.
+
+Exemples de variables :
+
+```text
+hour
+day_of_week
+day_of_year
+week_of_year
+month
+quarter
+season
+is_weekend
+is_peak_hour
+hour_sin
+hour_cos
+lag_1h_mw
+lag_24h_mw
+lag_168h_mw
+rolling_24h_mean
+rolling_24h_std
+forecast_j1_mw
+```
+
+Cette correction permet d’obtenir une évaluation plus réaliste du modèle.
+
+---
+
+## 8. Résultats du dernier run validé
+
+Le dernier run officiel validé est :
+
+```text
+run_id = 20260609_161434
+```
+
+Le modèle retenu est :
+
+```text
+RandomForest / Forêt aléatoire
+```
+
+### Métriques finales
+
+| Modèle           |      RMSE |       MAE |   MAPE |     R² |
+| ---------------- | --------: | --------: | -----: | -----: |
+| RandomForest     | 711.32 MW | 537.41 MW | 1.07 % | 0.9949 |
+| GradientBoosting | 712.84 MW | 547.22 MW | 1.10 % | 0.9949 |
+| LinearRegression | 741.73 MW | 582.10 MW | 1.16 % | 0.9945 |
+| DecisionTree     | 758.87 MW | 582.24 MW | 1.16 % | 0.9942 |
+
+Le modèle **RandomForest** est retenu car il obtient le RMSE le plus faible sur le jeu de test temporel.
+
+Même si Gradient Boosting est très proche, RandomForest présente un meilleur compromis entre précision, robustesse et simplicité de déploiement.
+
+---
+
+## 9. Interprétation des résultats
+
+Les résultats montrent que le modèle suit correctement la dynamique de la consommation électrique.
+
+Le **MAPE de 1.07 %** indique que l’erreur moyenne relative reste faible. Cela signifie que le modèle produit des prédictions cohérentes par rapport aux niveaux de consommation observés.
+
+Le **R² de 0.9949** montre que le modèle explique une grande partie de la variabilité de la consommation.
+
+Les visualisations générées permettent également de vérifier :
+
+* la comparaison réel vs prédit ;
+* la stabilité temporelle des prédictions ;
+* les erreurs résiduelles ;
+* la comparaison entre modèles ;
+* la cohérence du split temporel 80/20.
+
+---
+
+## 10. Rapports EDA et ML
+
+Le projet génère automatiquement des graphiques utilisés pour le rapport professionnel.
+
+### Exemples de rapports EDA
+
+* impact du nettoyage sur la consommation nationale ;
+* volume mensuel avant / après nettoyage ;
+* diagnostic de qualité des données ;
+* répartition train/test temporelle.
+
+### Exemples de rapports ML
+
+* comparaison des modèles ;
+* synthèse des performances ML ;
+* prédictions réel vs prédit ;
+* série temporelle des prédictions ;
+* courbe d’apprentissage.
+
+Les images sont générées dans :
+
+```text
+/opt/airflow/data/eda/report
+```
+
+et peuvent être copiées localement avec :
 
 ```bash
-cp eCO2mix_RTE_*.xls ./data/raw/
-make bootstrap
+docker cp edf-airflow-webserver:/opt/airflow/data/eda/report/. ./eda_report_images_clean
 ```
 
-`make bootstrap` exécute : création des répertoires locaux, build des images, démarrage de la stack, initialisation Kafka, schéma PostgreSQL et contrôle de santé.
+---
 
-### Premier run complet
+## 11. Monitoring Grafana
 
-**Via Airflow (recommandé, équivalent production) :**
+Grafana permet de suivre les indicateurs clés de la solution.
+
+Les dashboards permettent notamment de visualiser :
+
+* la consommation réelle vs la prévision J-1 ;
+* les agrégats journaliers ;
+* le mix énergétique ;
+* le meilleur modèle ;
+* le RMSE minimal ;
+* le R² maximal ;
+* les métriques détaillées par modèle ;
+* le nombre de runs ML enregistrés.
+
+Le dernier dashboard ML confirme :
+
+```text
+Meilleur modèle : RandomForest
+RMSE minimal : 711.3
+R² max : 99.490 %
+Runs ML enregistrés : 4
+```
+
+---
+
+## 12. Lancement de la plateforme
+
+Depuis la racine du projet :
 
 ```bash
-make pipeline
+docker compose up -d
 ```
 
-Enchaîne : attente du DAG `edf_pipeline_complet` (ETL, qualité, ML, **rapports EDA dans Airflow**) → affichage des métriques ML (`make ml-metrics`).
-
-Les graphiques **données (3 PNG)** et **ML dashboard (jusqu'à 6 PNG)** sont produits **dans le conteneur Airflow** (TaskGroup `reporting`) et persistés dans `./data/eda/report/` + MinIO `rapport-eda`.
-
-**Via Spark direct (debug, sans scheduler) :**
+Vérifier les services :
 
 ```bash
-make pipeline-spark
+docker compose ps
 ```
 
-Enchaîne : ETL jobs 1→3 + rapport données (3 PNG) → ML + tuiles dashboard ML (jusqu'à 6 PNG) → métriques → enregistrement du run dans `etl.pipeline_runs`.
-
----
-
-## Chaîne de traitement
-
-| # | Couche | Script | Entrée | Sortie principale |
-|---|--------|--------|--------|-------------------|
-| 1 | Bronze | `xls_to_bronze.py` | XLS dans `data/raw/` | `s3a://edf-bronze/rte/` |
-| 2 | Silver | `bronze_to_silver.py` | Bronze MinIO | Silver MinIO + `dw.fact_consumption_silver` |
-| 3 | Gold | `silver_to_gold.py` | Silver | Gold MinIO + `dw.agg_daily`, `dw.agg_monthly` |
-| 4 | ML | `gold_to_model.py` | Silver ML-ready | `s3a://models/rte/` + `etl.model_metrics` |
-
-### Ingestion Bronze
-
-| Mode | Mécanisme | Usage |
-|------|-----------|-------|
-| **Batch** | Spark `xls_to_bronze` | Historique multi-années, recette complète |
-| **Streaming** | XLS → Kafka → consumer → Bronze | Delta quotidien J/J-1 |
-
-Les couches Silver, Gold et ML partagent le même code Spark, quel que soit le chemin Bronze.
-
----
-
-## Modes d'exécution
-
-### Comparatif
-
-| Critère | Spark direct (`Makefile`) | Airflow |
-|---------|---------------------------|---------|
-| Déclenchement | Commandes `make run-*` | Scheduler cron ou UI |
-| Retries | Relance manuelle | Configurables (ex. 2 × 10 min) |
-| Audit | Logs conteneur + tables DW | `etl.pipeline_runs` + logs tâches |
-| Usage | Développement, debug, job isolé | Production, SLA, historique |
-| Pipeline complet | `make pipeline-spark` | `make pipeline` ou DAG `edf_pipeline_complet` |
-| Rapport EDA (9 PNG max) | `make report-eda*` (CLI hôte) | Tâches `reporting.*` dans le DAG (prod & dev) |
-
-### Commandes Makefile
-
-Liste complète et à jour : **`make help`** (groupé par section).
-
-| Commande | Description |
-|----------|-------------|
-| `make bootstrap` | Build, stack, Kafka, schéma PostgreSQL |
-| `make pipeline` | Attente du DAG `edf_pipeline_complet` (EDA inclus) + `ml-metrics` |
-| `make pipeline-spark` | ETL + ML via Spark REST (sans Airflow) + rapports CLI |
-| `make reset-zero` | Purge locale + volumes Docker — puis relancer `make bootstrap` |
-| `make run-etl` | Jobs 1→3, contrôles qualité, rapport données (3 PNG) |
-| `make run-ml` | Job 4, tuiles ML dashboard (jusqu'à 6 PNG) |
-| `make validate-xls-sources` | Contrôles XLS avant Bronze (plages, trous d'années) |
-| `make run-quality-checks` | Contrôles qualité Silver/Gold (post-ETL, bloquant si critique) |
-| `make check-ml-readiness` | Seuil `ML_MIN_TRAINING_ROWS` avant entraînement ML |
-| `make report-eda` | Rapport complet en CLI locale (relance manuelle) |
-| `make report-eda-data` | 3 graphiques données (XLS) en CLI locale |
-| `make report-eda-ml` | Tuiles ML dashboard en CLI locale (après entraînement ML) |
-| `make sync-report-eda-minio` | Pousser les PNG locaux `data/eda/report/` → MinIO `rapport-eda` |
-| `make purge-local` | Caches Python, logs Airflow, PNG EDA/ML locaux (sans volumes Docker) |
-| `make sync-models-local` | Télécharge `models/` MinIO → `data/models/rte/` |
-| `make ml-metrics` | Affiche les dernières métriques PostgreSQL |
-| `make trigger-pipeline-wait` | Déclenche `edf_pipeline_complet` et attend la fin |
-| `make trigger-pipeline` | Déclenche `edf_pipeline_complet` sans attendre |
-| `make health` | Contrôle de santé des services |
-| `make urls` | URLs et identifiants des interfaces |
-
-**Jobs individuels :**
+Arrêter les services sans supprimer les volumes :
 
 ```bash
-make run-xls-to-bronze
-make run-bronze-to-silver
-make run-silver-to-gold
-make run-gold-to-model
+docker compose down
 ```
 
----
-
-## Orchestration Airflow
-
-### Environnement dev / prod
-
-| Variable | Dev (défaut) | Prod |
-|----------|--------------|------|
-| `EDF_ENVIRONMENT` | `dev` | `prod` |
-| Planification DAGs | Aucune (trigger manuel) | Crons actifs |
-
-| Variable | Cron prod (défaut) | DAG |
-|----------|-------------------|-----|
-| `EDF_PIPELINE_SCHEDULE` | `0 3 * * 0` (dim. 03:00 UTC) | `edf_pipeline_complet` |
-| `EDF_ETL_SCHEDULE` | `0 2 * * *` (quotidien 02:00 UTC) | `edf_etl_pipeline` |
-| `EDF_ML_SCHEDULE` | `0 4 * * 1` (lun. 04:00 UTC) | `edf_ml_pipeline` |
-| `EDF_QUALITY_SCHEDULE` | `30 6 * * *` (quotidien 06:30 UTC) | `edf_quality_monitoring` |
-
-Activation production :
+Attention : la commande suivante supprime les volumes Docker et doit être utilisée avec prudence :
 
 ```bash
-# .env
-EDF_ENVIRONMENT=prod
-
-docker compose restart airflow-scheduler
+docker compose down -v
 ```
-
-### DAG `edf_pipeline_complet`
-
-Pipeline batch complet (équivalent fonctionnel de `make pipeline`), avec retries et traçabilité.
-
-```
-start → prerequisites → bronze → silver → gold → quality
-     → reporting.generate_eda_data_report (3 graphiques données)
-     → ml.check_ml_readiness
-           ├─ ml.run_gold_to_model → reporting.generate_eda_ml_report (tuiles ML)
-           └─ ml.skip_ml_training → reporting.mark_eda_ml_pending
-     → finalize_pipeline_run → end
-```
-
-| Paramètre | Valeur |
-|-----------|--------|
-| Retries | 2 (pipeline), 1 (tâches EDA) |
-| Délai entre retries | 10 min |
-| Timeout | 8 h (pipeline), 3 h (ML), 20 min (EDA données) |
-| ML conditionnel | Skip si Silver < `ML_MIN_TRAINING_ROWS` (1000) |
-| EDA non bloquant | Par défaut : échec rapport ≠ échec pipeline (`EDA_FAIL_PIPELINE=false`) |
-
-**Soumission Spark :** `SparkRestSubmitOperator` via API REST du master (`http://spark-master:6066`). Workers **6G**, drivers **2g** (ETL) / **3g** (ML), executors **2g+768m** — le driver REST doit tenir dans la RAM worker (`driver.memory < SPARK_WORKER_MEMORY`). Scripts montés dans `/opt/spark-jobs/`. L'image Airflow n'inclut ni PySpark ni Java ; elle inclut **matplotlib** pour les rapports EDA.
-
-**Mode professionnel (re-runs sûrs) :**
-
-| Mécanisme | Comportement |
-|-----------|--------------|
-| Pool Airflow `spark_cluster` (1 slot) | Un seul job Spark REST actif — pipeline complet, streaming et ML ne se concurrencent plus |
-| `SILVER_PG_WRITE_MODE=upsert` | Silver PostgreSQL : insert + **update** si `datetime` existe (PG = Parquet) |
-| `GOLD_PG_WRITE_MODE=upsert` | Gold PostgreSQL : upsert sur `date` / `(year, month)` (sans truncate) |
-| MinIO Silver / Gold | Parquet en `overwrite` (rebuild complet du lac) |
-| `etl.pipeline_runs` / `etl.model_metrics` | Historique conservé (append) |
-
-Création du pool : `make ensure-spark-pool` (inclus dans `make bootstrap`). Après changement plugin : `make restart-airflow`.
-
-**Logique EDA partagée :** `spark/common/eda_report.py` (source unique), appelée par Airflow (`edf_pipeline/eda_report.py`) et par la CLI (`scripts/generate_report_eda.py`).
-
-### Autres DAGs
-
-| DAG | Rôle | Trigger manuel |
-|-----|------|----------------|
-| `edf_etl_pipeline` | Streaming Kafka → Bronze → Silver → Gold | `make trigger-dag DAG=edf_etl_pipeline` |
-| `edf_ml_pipeline` | Ré-entraînement ML + tuiles ML dashboard (sans relancer l'ETL) | `make trigger-dag DAG=edf_ml_pipeline` |
-| `edf_quality_monitoring` | Contrôles qualité globaux DW | `make trigger-dag DAG=edf_quality_monitoring` |
-
-### Calendrier type production (UTC)
-
-| Heure | Fréquence | DAG |
-|-------|-----------|-----|
-| 02:00 | Quotidien | `edf_etl_pipeline` |
-| 03:00 | Dimanche | `edf_pipeline_complet` |
-| 04:00 | Lundi | `edf_ml_pipeline` |
-| 06:30 | Quotidien | `edf_quality_monitoring` |
-
-Interface : [http://localhost:8081](http://localhost:8081) — identifiants `admin` / `admin123`.
 
 ---
 
-## Rapports et modèles ML
+## 13. Interfaces principales
 
-### Rapport visuel
+| Service      | URL                   |
+| ------------ | --------------------- |
+| Airflow      | http://localhost:8081 |
+| Spark Master | http://localhost:8082 |
+| MinIO        | http://localhost:9001 |
+| Grafana      | http://localhost:3001 |
+| Prometheus   | http://localhost:9090 |
+| Kafka UI     | http://localhost:8085 |
 
-**Orchestration (recommandé — dev & prod) :** tâches Airflow du TaskGroup `reporting` dans `edf_pipeline_complet` (tuiles ML dans `edf_ml_pipeline`).
+---
 
-**CLI locale (debug / régénération manuelle) :** `scripts/generate_report_eda.py` via `make report-eda*`.
+## 14. Vérifications utiles
 
-Les graphiques sont persistés dans **`./data/eda/report/`** (volume Docker monté côté Airflow) et dans le bucket MinIO **`rapport-eda`**.
-
-**Données (3 PNG — comparaison source brute XLS vs couche Silver ETL, uniquement si l'ETL a été exécuté) :**
-
-| Fichier | Contenu |
-|---------|---------|
-| `consommation_electrique_nationale.png` | Courbe brute (gris, pointillés) vs nettoyée (bleu) · outliers marqués · zones de trous · barres d'écart journalier colorées (inchangé / imputation / anomalie supprimée) |
-| `volume_mensuel_de_consommation.png` | Barres groupées TWh par mois (brut vs Silver) · tendance sur Silver · % d'écart · tableau récap du mois le plus impacté |
-| `qualite_des_donnees_source.png` | Dashboard 4 quadrants : complétude avant/après · heatmaps d'anomalies · histogrammes/KDE consommation · tableau statistique (μ, σ, min/max, outliers) |
-
-La couche **Silver** est lue **uniquement** depuis `dw.fact_consumption_silver` (PostgreSQL) sur la même fenêtre temporelle que les XLS. **Aucune valeur simulée** : si l'ETL n'a pas été exécuté, seule la source brute est affichée (message dans le sous-titre).
-
-Convention visuelle : **gris = données brutes (source XLS)** · **bleu = données nettoyées (Silver ETL)** · **barres d'écart** : vert = inchangé, bleu = correction mineure, orange = correction majeure, rouge = anomalie supprimée.
-
-**ML dashboard (jusqu'à 6 PNG — après entraînement + `etl.model_metrics`) :**
-
-| Fichier | Contenu |
-|---------|---------|
-| `courbe_apprentissage_foret_aleatoire.png` | Courbe d'apprentissage RF — entraînement vs validation |
-| `predictions_dispersion_reel_vs_predit.png` | Graphique A — nuage réel vs prédit, bande ±2×RMSE, LOESS |
-| `predictions_serie_temporelle_ecarts.png` | Graphique B — séries temporelles par bloc, MM 6 h, écarts |
-| `comparaison_des_modeles.png` | Comparaison RMSE et R² entre modèles |
-| `synthese_performance_ml.png` | Tableau comparatif + heatmap des métriques |
-| `repartition_des_donnees.png` | Camembert split temporel train / test (80/20) |
-
-Les tuiles courbe d'apprentissage et prédictions nécessitent les artefacts dans `data/models/rte/_report/` (`learning_curve.parquet`, `predictions.parquet`). Sans entraînement ML, les tuiles ML ne sont pas produites ; un fichier `ml_dashboard.pending` est créé.
-
-**Modèle & artefacts ML :** entraînement → `s3a://models/rte/best/` + miroir `data/models/rte/best/` ; artefacts rapport (`predictions.parquet`, `learning_curve.parquet`, `split_summary.json`) sous `data/models/rte/_report/`.
+### Vérifier la résolution DNS Docker
 
 ```bash
-# Production-like (EDA dans le DAG)
-make pipeline
-
-# Debug Spark + rapports CLI
-make pipeline-spark
-
-# Régénération manuelle sans relancer l'ETL
-make report-eda-data
-make report-eda-ml      # nécessite etl.model_metrics
-make report-eda         # complet
-make sync-report-eda-minio   # rattrapage MinIO si PNG déjà générés en local
+docker compose exec airflow-webserver getent hosts postgres
+docker compose exec airflow-webserver getent hosts spark-master
 ```
 
-### Modèles ML
-
-| Algorithme | Estimateur Spark | Rôle |
-|------------|------------------|------|
-| Linear Regression | `LinearRegression` | Baseline interprétable |
-| Decision Tree | `DecisionTreeRegressor` | Non-linéarités locales |
-| Random Forest | `RandomForestRegressor` | Robustesse |
-| Gradient Boosting | `GBTRegressor` | Performance (souvent meilleur RMSE) |
-
-**Sélection :** modèle retenu = RMSE minimal sur le jeu de test (split temporel 80/20).
-
-**Métriques :** RMSE, MAE, MAPE %, R² — historisées dans `etl.model_metrics`.
-
-**Persistance :**
-
-| Emplacement | Chemin |
-|-------------|--------|
-| MinIO | `s3a://models/rte/` et `s3a://models/rte/best/` |
-| Local | `data/models/rte/` (sync depuis MinIO après `gold_to_model` ; rattrapage : `make sync-models-local`) |
-
----
-
-## Qualité et observabilité
-
-| Niveau | Déclencheur |
-|--------|-------------|
-| Post-ETL batch | Fin de `edf_pipeline_complet` |
-| Streaming | Fin de `edf_etl_pipeline` |
-| Monitoring global | DAG `edf_quality_monitoring` (06:30 UTC en prod) |
-
-**Persistance :** `etl.data_quality_checks`, `etl.pipeline_runs`, `etl.model_metrics`.
-
-**Monitoring :**
-
-| Outil | URL | Contenu |
-|-------|-----|---------|
-| Grafana | http://localhost:3001 (`admin` / `edf-admin`) | 2 dashboards provisionnés dans le dossier **EDF ETL** |
-| Prometheus | http://localhost:9090 | Scrapes Postgres, Kafka, MinIO, Spark |
-
-| Dashboard Grafana | UID | Contenu |
-|-------------------|-----|---------|
-| **Vue plateforme** (accueil) | `edf-platform-overview` | Santé infra (UP, lag Kafka, Spark, MinIO), runs ETL, qualité |
-| **Analytics & ML** | `edf-data-analytics` | Consommation RTE, mix énergétique, benchmark RMSE, évolution ML |
-
-Les graphiques métier utilisent le **dernier jeu de données DW** (fenêtre glissante relative à `MAX(datetime)`), adapté aux jeux historiques multi-années.
+### Vérifier PostgreSQL
 
 ```bash
-make health
-make status
-make logs
-make ml-metrics
+docker compose exec postgres pg_isready -U edf -d edf_dw
 ```
 
-Variable `QUALITY_FAIL_ON_WARNING=true` dans `.env` pour faire échouer le pipeline sur les warnings qualité.
-
----
-
-## Configuration
-
-Fichier `.env` à la racine, chargé par Docker Compose, Airflow et les scripts locaux.
-
-### Orchestration
-
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `EDF_ENVIRONMENT` | `dev` | `dev` = DAGs manuels ; `prod` = crons actifs |
-| `SPARK_REST_URL` | `http://spark-master:6066` | API REST Spark (Airflow) |
-| `SPARK_REST_TIMEOUT_SECONDS` | `14400` (4 h) | Attente max job ETL (bronze/silver/gold) |
-| `SPARK_REST_ML_TIMEOUT_SECONDS` | `14400` (4 h) | Attente max job ML |
-| `SPARK_REST_EXECUTION_BUFFER_SECONDS` | `900` (15 min) | Marge Airflow au-dessus du poll Spark |
-| `SPARK_ETL_DEPLOY_MODE` | `client` | `client` = driver master ; `cluster` = driver worker |
-| `SPARK_ML_DEPLOY_MODE` | `client` | Idem pour le job ML |
-| `SPARK_WORKER_MEMORY` | `6G` | RAM Spark par worker (docker-compose + `.env`) |
-| `SPARK_DRIVER_MEMORY` | `2g` (Airflow REST) / `5g` (`make run-*` direct) | Driver ETL — doit rester < RAM worker en mode cluster |
-| `SPARK_ML_DRIVER_MEMORY` | `3g` (Airflow REST) / `5g` (`make run-gold-to-model` direct) | Driver ML |
-| `SPARK_EXECUTOR_MEMORY` | `2g` | Exécuteurs (+ `SPARK_EXECUTOR_MEMORY_OVERHEAD=768m`) |
-| `SPARK_REST_SUBMITTED_TIMEOUT_SECONDS` | `1800` (30 min) | Échec rapide si driver bloqué en SUBMITTED |
-| `AIRFLOW_SPARK_POOL` | `spark_cluster` | Pool Airflow — sérialise les jobs Spark REST |
-| `AIRFLOW_SPARK_POOL_SLOTS` | `1` | Nombre de jobs Spark simultanés sur le cluster |
-| `SILVER_PG_WRITE_MODE` | `upsert` | `upsert` = insert+update ; `merge` = insert si absent ; `overwrite` = truncate |
-| `SILVER_PG_MERGE_KEYS` | `datetime` | Clés ON CONFLICT (modes `upsert` / `merge`) |
-| `SILVER_PG_STAGING_TABLE` | `dw.fact_consumption_silver_staging` | Table staging JDBC pour `upsert` Silver |
-| `GOLD_PG_WRITE_MODE` | `upsert` | Chargement Gold PG : `upsert`, `merge` ou `overwrite` |
-| `GOLD_DAILY_STAGING_TABLE` | `dw.agg_daily_staging` | Staging upsert `dw.agg_daily` |
-| `GOLD_MONTHLY_STAGING_TABLE` | `dw.agg_monthly_staging` | Staging upsert `dw.agg_monthly` |
-| `SPARK_JOBS_DIR` | `/opt/spark-jobs` | Scripts PySpark sur le cluster |
-| `POSTGRES_CONN` | `postgresql://edf:…` | DSN PostgreSQL |
-| `BRONZE_INCLUDE_STREAMING` | `true` | Fusionne `bronze/streaming/` dans Silver |
-
-### Lac de données (MinIO)
-
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `BRONZE_PATH` | `s3a://edf-bronze/rte/` | Préfixe Bronze |
-| `SILVER_PATH` | `s3a://edf-silver/rte/` | Préfixe Silver |
-| `GOLD_PATH` | `s3a://edf-gold/rte/` | Préfixe Gold |
-| `ML_MODEL_PATH` | `s3a://models/rte/` | Modèles ML sur MinIO |
-| `MODEL_LOCAL_PATH` | `data/models/rte` (hôte) | Miroir local des modèles |
-| `REPORT_EDA_BUCKET` | `rapport-eda` | Bucket PNG du rapport EDA |
-| `REPORT_EDA_S3_PREFIX` | `report/` | Préfixe objet MinIO (ex. `report/consommation_….png`) |
-| `REPORT_EDA_LOCAL` | `data/eda/report` | Chemin local hôte ; Airflow : `/opt/airflow/data/eda/report` |
-| `DATA_DIR` | `data/raw` (CLI hôte, via `make report-eda*`) ; `/opt/airflow/data/raw` (Airflow) ; défaut code sans env : `/opt/airflow/data` | Répertoire des fichiers XLS RTE (`eCO2mix*.xls`, hors `tempo`) |
-| `EDA_FAIL_PIPELINE` | `false` | Si `true`, échec rapport EDA = échec DAG |
-
-### Machine Learning
-
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `ML_LABEL_COL` | `consumption_mw` | Variable cible |
-| `ML_TRAIN_RATIO` | `0.8` | Split temporel train/test |
-| `ML_MIN_TRAINING_ROWS` | `1000` | Seuil minimal Silver pour entraîner |
-| `ML_RF_NUM_TREES` / `ML_GBT_MAX_ITER` | 30 | Hyperparamètres |
-
----
-
-## Interfaces
-
-| Service | URL | Identifiants |
-|---------|-----|--------------|
-| Airflow | http://localhost:8081 | admin / admin123 |
-| Spark Master UI | http://localhost:8082 | — |
-| MinIO Console | http://localhost:9001 | edfadmin / edfpassword123 |
-| Kafka UI | http://localhost:8085 | — |
-| Grafana | http://localhost:3001 | admin / edf-admin |
-| Prometheus | http://localhost:9090 | — |
-| PostgreSQL | localhost:5432 / `edf_dw` | edf / edf123 |
-
-Liste complète : `make urls`.
-
-### Spark bloqué en SUBMITTED
-
-Si les logs Airflow répètent `Driver state: SUBMITTED` (> 30 min) :
-
-1. Ouvrir [Spark UI](http://localhost:8082) — vérifier workers saturés ou **drivers zombies** (jobs laissés par un timeout Airflow précédent).
-2. `make restart-spark` — libère les ressources workers.
-3. Relancer le DAG ou laisser le retry Airflow.
-
-Après mise à jour du plugin : `make restart-airflow` (préférer à `docker compose restart` — bug Docker Desktop).
-
-Après activation du mode professionnel sur un environnement existant :
+### Vérifier les dernières métriques ML
 
 ```bash
-make ensure-spark-pool
-make restart-airflow
+docker compose exec postgres psql -U edf -d edf_dw -P pager=off -c "SELECT run_id, model_name, ROUND(rmse::numeric,2) AS rmse, ROUND(mae::numeric,2) AS mae, ROUND(mape_pct::numeric,2) AS mape, ROUND(r2::numeric,4) AS r2, trained_at FROM etl.model_metrics ORDER BY trained_at DESC, rmse ASC LIMIT 8;"
 ```
 
-### Job ML en FAILED (`ModuleNotFoundError: numpy`)
-
-Le driver Spark exécute `pyspark.ml` sur le worker : **numpy** doit être dans l'image `edf-spark`.
+### Vérifier les variables ML utilisées
 
 ```bash
-make build
-make restart-spark
+docker compose exec airflow-webserver python -c "from spark.ml.constants import CANDIDATE_FEATURES, FORBIDDEN_LEAKAGE_FEATURES; print('CANDIDATE_FEATURES =', CANDIDATE_FEATURES); print('Nombre features =', len(CANDIDATE_FEATURES)); print('Leakage =', set(CANDIDATE_FEATURES).intersection(FORBIDDEN_LEAKAGE_FEATURES))"
 ```
 
-Puis relancer `ml.run_gold_to_model` (Clear task dans Airflow ou `make run-gold-to-model`).
+Le résultat attendu est :
+
+```text
+Leakage = set()
+```
 
 ---
 
-## Schéma PostgreSQL
+## 15. Gestion des artefacts ML
 
-| Objet | Contenu |
-|-------|---------|
-| MinIO `edf-bronze` | Bronze Parquet (MinIO uniquement — pas de table PG) |
-| `dw.fact_consumption_silver` | Faits nettoyés + features (partition année) |
-| `dw.agg_daily` | Agrégats journaliers |
-| `dw.agg_monthly` | Agrégats mensuels + YoY |
-| `etl.pipeline_runs` | Historique des exécutions |
-| `etl.data_quality_checks` | Résultats contrôles qualité |
-| `etl.model_metrics` | Métriques par modèle et par run |
+Les artefacts ML sont stockés dans MinIO et synchronisés localement.
 
-Schéma source : `infra/postgres/schema_dw.sql`.
+Les artefacts de reporting ML incluent notamment :
 
----
+```text
+predictions.parquet
+learning_curve.parquet
+split_summary.json
+run_meta.parquet
+```
 
-## Tests
+Un point important a été corrigé : certains anciens artefacts locaux pouvaient rester présents et générer des graphiques obsolètes. La solution consiste à supprimer les anciens artefacts locaux puis à resynchroniser les artefacts du dernier run validé.
 
-Les tests sont **unitaires** : aucun service Docker (PostgreSQL, MinIO, Airflow, Spark) n'est requis.
+Exemple de vérification :
 
 ```bash
-make dev-venv   # première fois : venv isolé (recommandé macOS)
-make test       # suite pytest (hors conteneur)
+docker compose exec airflow-webserver bash -lc 'ls -lh --full-time /opt/airflow/data/models/rte/_report'
 ```
 
-Couverture : parsing XLS RTE, contrôles qualité, planification dev/prod, sérialisation Parquet, parsing trigger Airflow (JSON uniquement — sans scheduler).
+Calcul direct des métriques depuis `predictions.parquet` :
 
-**macOS — erreur `Floating-point exception` :** utiliser le venv projet (`make dev-venv`) plutôt qu'un Python système avec des wheels numpy/pyarrow incompatibles.
+```bash
+python - <<'PY'
+import pandas as pd
+import numpy as np
+
+path = "/opt/airflow/data/models/rte/_report/predictions.parquet"
+df = pd.read_parquet(path)
+
+actual = df["actual_mw"].astype(float)
+pred = df["predicted_mw"].astype(float)
+err = actual - pred
+
+rmse = np.sqrt((err ** 2).mean())
+mae = np.abs(err).mean()
+mape = (np.abs(err) / actual.replace(0, np.nan)).mean() * 100
+
+print("RMSE:", round(rmse, 2))
+print("MAE :", round(mae, 2))
+print("MAPE:", round(mape, 2))
+PY
+```
+
+Résultat attendu pour le dernier run propre :
+
+```text
+RMSE : 711.32
+MAE  : 537.41
+MAPE : 1.07
+```
 
 ---
 
-## Structure du projet
+## 16. Maintenabilité
 
+La solution intègre plusieurs éléments de maintenabilité :
+
+* orchestration claire du pipeline avec Airflow ;
+* séparation des couches Bronze, Silver et Gold ;
+* logs Airflow et Spark ;
+* métriques stockées dans PostgreSQL ;
+* artefacts ML stockés dans MinIO ;
+* visualisation des résultats avec Grafana ;
+* contrôle de la cohérence des métriques ;
+* possibilité de relancer une tâche ciblée ;
+* possibilité de comparer plusieurs modèles ;
+* possibilité de revenir à une version stable du modèle.
+
+---
+
+## 17. Runbook rapide
+
+### Démarrer la plateforme
+
+```bash
+docker compose up -d
 ```
-edf-etl-platform/
-├── airflow/
-│   ├── dags/                    # DAGs Airflow
-│   └── plugins/edf_pipeline/    # Tâches, qualité, Spark REST, eda_report, audit
+
+### Vérifier les conteneurs
+
+```bash
+docker compose ps
+```
+
+### Lancer le pipeline depuis Airflow
+
+Ouvrir :
+
+```text
+http://localhost:8081
+```
+
+Puis déclencher le DAG :
+
+```text
+edf_pipeline_complet
+```
+
+### Consulter Spark
+
+```text
+http://localhost:8082
+```
+
+### Consulter MinIO
+
+```text
+http://localhost:9001
+```
+
+### Consulter Grafana
+
+```text
+http://localhost:3001
+```
+
+### Consulter les logs Airflow
+
+```bash
+docker compose logs airflow-webserver
+docker compose logs airflow-scheduler
+```
+
+### Consulter les logs Spark
+
+```bash
+docker compose logs spark-master
+docker compose logs spark-worker-1
+docker compose logs spark-worker-2
+```
+
+---
+
+## 18. Incidents fréquents
+
+| Incident                        | Cause possible                        | Action corrective                         |
+| ------------------------------- | ------------------------------------- | ----------------------------------------- |
+| Airflow affiche une tâche rouge | Erreur script ou service indisponible | Lire les logs de la tâche                 |
+| Spark driver en erreur          | Ressources, script ou réseau Docker   | Vérifier Spark UI et logs workers         |
+| DNS Docker instable             | Problème réseau Docker temporaire     | Redémarrer les services ou Docker Desktop |
+| Grafana vide                    | Source de données absente             | Vérifier PostgreSQL / Prometheus          |
+| Images ML incohérentes          | Ancien artefact local                 | Supprimer `_report` et resynchroniser     |
+| Modèle absent                   | Entraînement non terminé              | Relancer `run_gold_to_model`              |
+| MinIO vide                      | Étape précédente non exécutée         | Relancer Bronze / Silver / Gold           |
+
+---
+
+## 19. Sécurité et RGPD
+
+Les données RTE éCO2mix utilisées dans ce projet sont des données énergétiques agrégées. Elles ne contiennent pas directement de données personnelles.
+
+Cependant, le projet prend en compte les principes suivants :
+
+* limitation des données utilisées ;
+* séparation des rôles techniques ;
+* protection des accès aux interfaces ;
+* protection des secrets et variables d’environnement ;
+* contrôle des accès aux buckets MinIO ;
+* traçabilité des traitements ;
+* conservation des logs d’exécution ;
+* supervision des services critiques.
+
+L’analyse DIC est également prise en compte :
+
+| Axe             | Risque                                            | Mesure                                                    |
+| --------------- | ------------------------------------------------- | --------------------------------------------------------- |
+| Disponibilité   | Service Airflow / Spark / PostgreSQL indisponible | Monitoring, logs, redémarrage contrôlé                    |
+| Intégrité       | Données ou artefacts obsolètes                    | Contrôles qualité, versioning, vérification des métriques |
+| Confidentialité | Accès non autorisé aux interfaces                 | Authentification, gestion des droits, secrets hors code   |
+
+---
+
+## 20. Limites actuelles
+
+La solution actuelle fonctionne dans un environnement de simulation Docker Compose. Elle n’est pas encore une production réelle.
+
+Limites identifiées :
+
+* haute disponibilité non complète ;
+* sauvegardes à automatiser ;
+* alertes Grafana à connecter à email ou Teams ;
+* tests de charge à renforcer ;
+* suivi de dérive modèle à améliorer ;
+* variables météo non encore intégrées ;
+* exposition API du modèle non encore finalisée ;
+* versioning MLOps à renforcer avec un outil comme MLflow.
+
+---
+
+## 21. Perspectives d’amélioration
+
+Les prochaines évolutions possibles sont :
+
+* déploiement sur Kubernetes ;
+* intégration d’un outil MLOps comme MLflow ;
+* ajout d’une API de prédiction ;
+* ajout de données météo ;
+* ajout des jours fériés et vacances scolaires ;
+* alertes Grafana automatiques ;
+* sauvegarde automatique PostgreSQL / MinIO ;
+* tests de charge ;
+* monitoring avancé de la dérive des données et du modèle.
+
+---
+
+## 22. Structure simplifiée du projet
+
+```text
+edf-energy-prediction/
+├── dags/
+├── plugins/
 ├── spark/
-│   ├── common/                  # config, session, object_storage, eda_style, eda_report, eda_specs
-│   ├── transform/               # Logique médaillon
-│   ├── ml/                      # training, metrics_store
-│   └── jobs/                    # Orchestrateurs (xls_to_bronze, …)
-├── scripts/
-│   └── generate_report_eda.py   # CLI rapport EDA (wrapper vers spark.common.eda_report)
-├── rte_pipeline/
-│   └── parsing/xls.py           # Parsing RTE partagé
-├── infra/                       # PostgreSQL, Prometheus, Grafana
+│   ├── jobs/
+│   ├── transform/
+│   ├── ml/
+│   └── common/
 ├── data/
-│   ├── raw/                     # XLS source
-│   ├── eda/report/              # Rapports PNG (miroir local, gitignoré)
-│   └── models/rte/              # Modèles ML (miroir local)
-│       ├── best/                # Meilleur modèle Spark ML
-│       └── _report/             # Artefacts EDA (predictions, courbe, split)
-├── tests/
-├── Makefile
+│   ├── raw/
+│   ├── bronze/
+│   ├── silver/
+│   ├── gold/
+│   ├── models/
+│   └── eda/
 ├── docker-compose.yml
-└── .env
+├── Makefile
+├── README.md
+└── .gitignore
 ```
 
 ---
 
-## Runbook opérationnel
+## 23. Auteurs
 
-### Relancer une couche isolée
+Projet réalisé dans le cadre de la MSPR EPSI 2025–2026.
 
-```bash
-make run-bronze-to-silver
-make run-silver-to-gold
-make run-gold-to-model
-```
+Membres du groupe :
 
-### Régénérer les rapports sans relancer l'ETL
-
-**CLI locale (hôte) :**
-
-```bash
-make report-eda-data
-make report-eda-ml      # nécessite des métriques dans etl.model_metrics
-```
-
-**Via Airflow :** relancer uniquement les tâches `reporting.generate_eda_data_report` et/ou `reporting.generate_eda_ml_report` depuis l'UI (Clear → Downstream).
-
-**Rattrapage MinIO** (PNG déjà présents en local) :
-
-```bash
-make sync-report-eda-minio
-```
-
-### Après modification du plugin Airflow ou des DAGs
-
-```bash
-make build
-docker compose restart airflow-scheduler airflow-webserver
-```
-
-### Rattrapage modèles locaux
-
-```bash
-make sync-models-local
-```
-
-### Réinitialisation
-
-**Local uniquement** (caches, logs, PNG générés — conserve les XLS et les volumes Docker) :
-
-```bash
-make purge-local
-```
-
-**Stack Docker complète** (arrêt + suppression des volumes MinIO/PostgreSQL) :
-
-```bash
-make clean
-make bootstrap
-```
-
-**Tout en une commande** (purge locale + volumes Docker) :
-
-```bash
-make reset-zero
-make bootstrap
-```
-
-### Conventions de commit
-
-Format [Conventional Commits](https://www.conventionalcommits.org/) : `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`.
+* Mohamed Barhami
+* Imane
+* Zineb
+* Karim
+* Hamza
 
 ---
 
-## Référence données RTE
+## 24. Licence
 
-Plus de **40 colonnes** mappées dans `rte_pipeline/parsing/xls.py` : consommation, prévisions J/J-1, nucléaire, éolien, solaire, hydraulique, gaz, fioul, charbon, bioénergies, stockage, échanges et taux CO₂.
+Projet académique réalisé dans le cadre de la formation EPSI.
+Les données utilisées proviennent de RTE éCO2mix.

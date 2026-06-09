@@ -1,38 +1,48 @@
-# =======================================================================
-# **************    Projet : EDF Energy Prediction         **************
-# **************    Version : 1.0.0                        **************
-# =======================================================================
-#
-# .gitignore — Fichiers ignorés par Git
-# =======================================================================
-
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
+env/
+
+# Environnements / secrets
 .env
+*.env
+.env.*
+secrets/
+credentials/
+*.key
+*.pem
+
+# Docker / logs
 *.log
-
-# Données locales (lac MinIO = volume Docker minio_data)
-data/eda/
-data/models/
-data/raw/*.xls
-data/raw/*.xlsx
-
-# Airflow
+logs/
 airflow/logs/
-airflow/plugins/__pycache__/
 
-# Spark
-spark/logs/
-*.jar
+# Données volumineuses
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+data/tmp/
+data/cache/
+*.parquet
+*.csv
+*.xlsx
+*.xls
 
-# Docker
-.docker/
+# Modèles et artefacts générés
+data/models/
+models/
+outputs/
+reports/
+_report/
 
-# IDE
-.vscode/
-.idea/
-*.swp
+# Jupyter
+.ipynb_checkpoints/
+
+# Système
 .DS_Store
-.pytest_cache/
+Thumbs.db

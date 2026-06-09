@@ -911,7 +911,7 @@ def plot_predictions_dispersion(ax: plt.Axes, preds: pd.DataFrame) -> None:
     ax.set_ylim(lo_p, hi_p)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Consommation réelle (MW)")
-    ax.set_ylabel("Prédiction Forêt aléatoire (MW)")
+    ax.set_ylabel("Prediction du modele retenu (MW)")
     format_mw_axis(ax, unit="MW")
 
     metrics_text = (

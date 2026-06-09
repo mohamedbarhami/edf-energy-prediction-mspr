@@ -64,19 +64,29 @@ DATA_CHART_SPECS: tuple[tuple[str, str], ...] = (
     ("Qualité des données — diagnostic avant / après ETL", DATA_CHART_FILENAMES[2]),
 )
 
+# =======================================================================
+# Graphiques ML
+# =======================================================================
+# Correction :
+# - Les graphiques de prédiction ne sont plus nommés "Forêt aléatoire".
+# - Ils sont nommés "modèle retenu", car le meilleur modèle peut changer.
+# - La courbe d'apprentissage reste liée à la forêt aléatoire, mais elle est
+#   indiquée comme analyse complémentaire pour éviter la confusion.
+# =======================================================================
+
 ML_CHART_SPECS: tuple[tuple[str, str, str], ...] = (
     (
-        "Courbe d'apprentissage – Forêt aléatoire (RMSE vs taille d'entraînement)",
+        "Courbe d'apprentissage – Forêt aléatoire, analyse complémentaire",
         ML_CHART_FILENAMES[0],
-        "Entraînement (bleu) vs validation (orange) · axe X logarithmique · trait = meilleur compromis",
+        "Entraînement (bleu) vs validation (orange) · axe X logarithmique · analyse complémentaire",
     ),
     (
-        "Performance des prédictions – Forêt aléatoire (jeu de test)",
+        "Performance des prédictions – modèle retenu (jeu de test)",
         ML_CHART_FILENAMES[1],
         "Graphique A · nuage de points coloré par |erreur| · bande ±2×RMSE · courbe LOESS",
     ),
     (
-        "Performance des prédictions – Forêt aléatoire (jeu de test)",
+        "Performance des prédictions – modèle retenu (jeu de test)",
         ML_CHART_FILENAMES[2],
         "Graphique B · 2 blocs côte à côte (données RTE incomplètes entre les périodes) · MM 6 h · MAE par bloc",
     ),
@@ -88,7 +98,7 @@ ML_CHART_SPECS: tuple[tuple[str, str, str], ...] = (
     (
         "Synthèse de performance ML",
         ML_CHART_FILENAMES[4],
-        "Tableau comparatif · meilleure valeur en gras par colonne · Δ RMSE % vs forêt aléatoire",
+        "Tableau comparatif · meilleure valeur en gras par colonne · Δ RMSE % vs meilleur modèle",
     ),
     (
         "Répartition des données – Split temporel",
@@ -290,6 +300,7 @@ def load_ml_metrics() -> tuple[pd.DataFrame, str | None, str | None] | None:
             cur.execute(metrics_sql, (run_id,))
         else:
             cur.execute(fallback_sql)
+
         rows = cur.fetchall()
         cols = [desc[0] for desc in cur.description]
         cur.close()
@@ -305,6 +316,7 @@ def load_ml_metrics() -> tuple[pd.DataFrame, str | None, str | None] | None:
             else None
         )
         return df, str(run_id) if run_id else None, ts_label
+
     except Exception as exc:
         logger.warning("Unable to load ML metrics: %s", exc)
         return None
@@ -382,12 +394,15 @@ def _persist_chart(local_path: str) -> str | None:
 def _enrich_ml_subtitle(spec_index: int, metrics: pd.DataFrame) -> str:
     """Ajoute une phrase d'interprétation contextuelle au sous-titre du graphique."""
     _, _, base = ML_CHART_SPECS[spec_index]
+
     if spec_index != 3 or metrics.empty:
         return base
+
     ordered = metrics.sort_values("rmse").reset_index(drop=True)
     best = ordered.iloc[0]
     best_name = human_model_name(str(best["model_name"]))
     best_rmse = float(best["rmse"])
+
     linear = metrics[metrics["model_name"].str.contains("linear", case=False, na=False)]
     if not linear.empty and float(linear.iloc[0]["rmse"]) > best_rmse:
         lr_rmse = float(linear.iloc[0]["rmse"])
@@ -396,11 +411,13 @@ def _enrich_ml_subtitle(spec_index: int, metrics: pd.DataFrame) -> str:
             f"{base} · {best_name} réduit l'erreur de {reduction:.0f} % "
             "par rapport à la régression linéaire"
         )
+
     if len(ordered) >= 2:
         worst_rmse = float(ordered.iloc[-1]["rmse"])
         reduction = (1.0 - best_rmse / worst_rmse) * 100.0
         worst_name = human_model_name(str(ordered.iloc[-1]["model_name"]))
         return f"{base} · {best_name} réduit l'erreur de {reduction:.0f} % vs {worst_name}"
+
     return base
 
 
@@ -412,9 +429,11 @@ def _save_dashboard_figure(
     subtitle: str | None = None,
 ) -> str:
     title, filename, default_subtitle = ML_CHART_SPECS[spec_index]
+
     add_accent_bar(fig)
     add_chart_header(fig, title, subtitle=subtitle or default_subtitle)
     add_report_footer(fig)
+
     if spec_index in (1, 2):
         bottom = 0.14 if spec_index == 2 else 0.12
         fig.subplots_adjust(left=0.08, right=0.98, top=HEADER_BOTTOM - 0.01, bottom=bottom)
@@ -428,6 +447,7 @@ def _save_dashboard_figure(
         fig.subplots_adjust(bottom=0.18)
     else:
         apply_figure_layout(fig)
+
     return save_report_figure(fig, str(out / filename))
 
 
@@ -438,24 +458,31 @@ def chart_consumption(df_raw: pd.DataFrame, out: Path, df_silver: pd.DataFrame |
         if df_silver is not None and not df_silver.empty
         else None
     )
+
     fig, note = build_consumption_national_figure(ts_raw, ts_silver=ts_silver)
     subtitle = note or "Courbes superposées brute vs Silver · écarts colorés par type de correction"
+
     if df_silver is None or df_silver.empty:
         subtitle = f"{subtitle} · Silver indisponible — exécutez make run-etl".strip(" ·")
+
     add_accent_bar(fig)
     add_chart_header(fig, DATA_CHART_SPECS[0][0], subtitle=subtitle)
     add_report_footer(fig)
+
     return save_report_figure(fig, str(out / DATA_CHART_SPECS[0][1]))
 
 
 def chart_monthly(df_raw: pd.DataFrame, out: Path, df_silver: pd.DataFrame | None = None) -> str:
     fig, note = build_monthly_comparison_figure(df_raw, df_silver)
     subtitle = note or "Agrégats mensuels TWh — barres groupées brute vs Silver"
+
     if df_silver is None or df_silver.empty:
         subtitle = f"{subtitle} · Silver indisponible".strip(" ·")
+
     add_accent_bar(fig)
     add_chart_header(fig, DATA_CHART_SPECS[1][0], subtitle=subtitle)
     add_report_footer(fig)
+
     return save_report_figure(fig, str(out / DATA_CHART_SPECS[1][1]))
 
 
@@ -467,9 +494,11 @@ def chart_quality(
     cols = [c for c in KEY_NUMERIC if c in df_raw.columns]
     fig, note = build_quality_diagnostic_figure(df_raw, cols, df_silver)
     subtitle = note or "Dashboard 4 quadrants — complétude, anomalies, distribution, statistiques"
+
     add_accent_bar(fig)
     add_chart_header(fig, DATA_CHART_SPECS[2][0], subtitle=subtitle)
     add_report_footer(fig)
+
     return save_report_figure(fig, str(out / DATA_CHART_SPECS[2][1]))
 
 
@@ -482,8 +511,10 @@ def _remove_ml_pending(out: Path) -> None:
 def chart_learning_curve(curve: pd.DataFrame, out: Path) -> str:
     fig, ax = plt.subplots(figsize=(11, 5.8))
     plot_learning_curve_rf(ax, curve)
+
     base = ML_CHART_SPECS[0][2]
     detail = describe_learning_curve(curve)
+
     return _save_dashboard_figure(fig, 0, out, subtitle=f"{base} · {detail}")
 
 
@@ -500,7 +531,10 @@ def chart_predictions_timeseries(preds: pd.DataFrame, out: Path) -> str:
 def chart_model_comparison(metrics: pd.DataFrame, out: Path) -> str:
     fig, _axes = build_model_comparison_figure(metrics)
     return _save_dashboard_figure(
-        fig, 3, out, subtitle=_enrich_ml_subtitle(3, metrics),
+        fig,
+        3,
+        out,
+        subtitle=_enrich_ml_subtitle(3, metrics),
     )
 
 
@@ -508,22 +542,26 @@ def chart_ml_synthesis(metrics: pd.DataFrame, out: Path, *, best_model: str | No
     fig, _axes = build_ml_synthesis_figure(metrics, best_model=best_model)
     foot = synthesis_footnote(metrics, best_model=best_model)
     base = ML_CHART_SPECS[4][2]
+
     return _save_dashboard_figure(fig, 4, out, subtitle=f"{base} · {foot}")
 
 
 def chart_data_split(split_info: dict[str, Any], out: Path) -> str:
     fig, ax = plt.subplots(figsize=(9.5, 6.2))
     plot_data_split(ax, split_info)
+
     return _save_dashboard_figure(fig, 5, out)
 
 
 def mark_ml_pending(out: Path | None = None) -> None:
     out = out or report_output_dir()
+
     for _title, name, _subtitle in ML_CHART_SPECS:
         path = out / name
         if path.exists():
             path.unlink()
         remove_report_from_s3(name)
+
     pending = out / ML_PENDING
     pending.write_text(
         "Dashboard ML en attente.\n"
@@ -549,8 +587,10 @@ def generate_data_charts(out: Path | None = None) -> list[str]:
     apply_dashboard_style()
 
     logger.info("Loading RTE from %s", raw_data_dir())
+
     df_raw = load_bronze_sample()
     df_silver = load_silver_sample(df_raw)
+
     if df_silver is not None:
         logger.info("Silver loaded: %d rows for comparison", len(df_silver))
     else:
@@ -561,6 +601,7 @@ def generate_data_charts(out: Path | None = None) -> list[str]:
         ("mensuel", lambda: chart_monthly(df_raw, out, df_silver)),
         ("qualité", lambda: chart_quality(df_raw, out, df_silver)),
     ]
+
     paths: list[str] = []
     for label, builder in builders:
         path = _generate_and_persist_chart(label, builder)
@@ -569,6 +610,7 @@ def generate_data_charts(out: Path | None = None) -> list[str]:
 
     logger.info("%d data chart(s) -> %s", len(paths), report_destination_label(out))
     sync_report_charts_to_minio(out)
+
     return paths
 
 
@@ -590,9 +632,11 @@ def generate_ml_charts(
 
     metrics, _run_id, _trained_at = loaded
     artifacts = load_ml_artifacts()
+
     preds = artifacts.get("predictions", pd.DataFrame())
     curve = artifacts.get("learning_curve", pd.DataFrame())
     split_info = artifacts.get("split_info") or {"n_train": 0, "n_test": 0}
+
     best_model = str(metrics.sort_values("rmse").iloc[0]["model_name"])
 
     _remove_ml_pending(out)
@@ -632,4 +676,5 @@ def generate_ml_charts(
 
     logger.info("ML dashboard — %d tile(s), best model: %s", len(paths), best_model)
     sync_report_charts_to_minio(out)
+
     return paths

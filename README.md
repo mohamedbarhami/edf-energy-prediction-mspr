@@ -644,10 +644,10 @@ Projet réalisé dans le cadre de la MSPR EPSI 2025–2026.
 Membres du groupe :
 
 * Mohamed Barhami
-* Imane
-* Zineb
-* Karim
-* Hamza
+*christian
+hamza
+benoit
+youssef
 
 ---
 
